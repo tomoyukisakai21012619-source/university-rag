@@ -156,43 +156,38 @@ def answer_from_excel(question: str, claude_client: anthropic.Anthropic) -> str:
         if prefs:
             filtered = filtered[filtered["都道府県"].isin(prefs)]
     if conds.get("全体在学者数_以上") is not None:
-        filtered = filtered[filtered["全体在学者数"] >= conds["全体在学者数_以上"]]
+        filtered = filtered[filtered["全体在学者数"] >= float(conds["全体在学者数_以上"])]
     if conds.get("全体在学者数_以下") is not None:
-        filtered = filtered[filtered["全体在学者数"] <= conds["全体在学者数_以下"]]
+        filtered = filtered[filtered["全体在学者数"] <= float(conds["全体在学者数_以下"])]
     if conds.get("偏差値上限_以上") is not None:
-        filtered = filtered[filtered["偏差値上限"] >= conds["偏差値上限_以上"]]
+        filtered = filtered[filtered["偏差値上限"] >= float(conds["偏差値上限_以上"])]
     if conds.get("偏差値上限_以下") is not None:
-        filtered = filtered[filtered["偏差値上限"] <= conds["偏差値上限_以下"]]
+        filtered = filtered[filtered["偏差値上限"] <= float(conds["偏差値上限_以下"])]
     if conds.get("偏差値下限_以上") is not None:
-        filtered = filtered[filtered["偏差値下限"] >= conds["偏差値下限_以上"]]
+        filtered = filtered[filtered["偏差値下限"] >= float(conds["偏差値下限_以上"])]
+    if conds.get("偏差値下限_以下") is not None:
+        filtered = filtered[filtered["偏差値下限"] <= float(conds["偏差値下限_以下"])]
 
-    summary = f"条件に該当する大学数: {len(filtered)}校\n\n"
-    if len(filtered) <= 50:
-        rows = []
-        for _, row in filtered.iterrows():
-            rows.append(
-                f"・{row['大学名']}（{row['学校区分']}／{row['都道府県']}）"
-                f" 在学者数:{int(row['全体在学者数'])}人 偏差値:{row['偏差値下限']}〜{row['偏差値上限']}"
-            )
-        summary += "\n".join(rows)
+    # 結果を直接構築して返す（Claudeへの依存を最小化）
+    count = len(filtered)
+    rows = []
+    for _, row in filtered.iterrows():
+        rows.append(
+            f"・{row['大学名']}（{row['学校区分']}／{row['都道府県']}）"
+            f" 在学者数:{int(row['全体在学者数'])}人 偏差値:{row['偏差値下限']}〜{row['偏差値上限']}"
+        )
+
+    # 抽出した条件を表示（デバッグ用）
+    conds_str = "、".join([f"{k}={v}" for k, v in conds.items() if v is not None]) or "なし"
+
+    if count == 0:
+        detail = "該当する大学はありませんでした。"
+    elif count <= 100:
+        detail = "\n".join(rows)
     else:
-        summary += "（大学数が多いため一覧は省略します）"
+        detail = f"（{count}校あるため先頭30校のみ表示）\n" + "\n".join(rows[:30])
 
-    prompt = f"""以下の大学データをもとに、質問に日本語で回答してください。
-
-【データ】
-{summary}
-
-【質問】
-{question}
-"""
-    resp2 = claude_client.messages.create(
-        model="claude-sonnet-5",
-        max_tokens=2000,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    text_block = next((b for b in resp2.content if hasattr(b, "text")), None)
-    return text_block.text if text_block else "回答を生成できませんでした。"
+    return f"【抽出条件】{conds_str}\n\n【結果】{count}校が該当します。\n\n{detail}"
 
 
 def extract_filters(question: str, client: anthropic.Anthropic) -> dict:
