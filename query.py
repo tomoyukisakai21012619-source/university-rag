@@ -1,7 +1,10 @@
+import io
 import os
 import json
 import anthropic
 import voyageai
+import pandas as pd
+import requests
 from pinecone import Pinecone
 
 REGION_MAP = {
@@ -19,6 +22,16 @@ REGION_MAP = {
     "九州": ["福岡", "佐賀", "長崎", "熊本", "大分", "宮崎", "鹿児島"],
     "沖縄": ["沖縄"],
 }
+
+EXCEL_FILE_ID = "1ZBhQpO4cvu58uaD96rDVVFiypsM3r1SS"
+
+_df_cache = None
+
+STATS_KEYWORDS = [
+    "何校", "何大学", "いくつ", "何件", "件数", "数は", "数を",
+    "リストアップ", "一覧", "すべて", "全て", "列挙",
+    "平均", "最大", "最小", "合計", "ランキング", "上位", "下位",
+]
 
 FILTER_EXTRACTION_PROMPT = """
 ユーザーの質問から、以下の検索条件を抽出してください。
@@ -41,6 +54,132 @@ FILTER_EXTRACTION_PROMPT = """
 
 JSONのみ返してください。
 """
+
+STATS_FILTER_PROMPT = """
+ユーザーの質問から、大学データを絞り込む条件を抽出してください。
+該当しない場合はnullにしてください。
+
+質問: {question}
+
+抽出するJSON形式:
+{{
+  "学校区分": null または "私立" または "国立" または "公立",
+  "都道府県": null または ["都道府県名", ...],
+  "地域名": null または "関東" など,
+  "全体在学者数_以上": null または 数値,
+  "全体在学者数_以下": null または 数値,
+  "偏差値上限_以上": null または 数値,
+  "偏差値上限_以下": null または 数値,
+  "偏差値下限_以上": null または 数値,
+  "偏差値下限_以下": null または 数値
+}}
+
+JSONのみ返してください。
+"""
+
+
+def load_excel_df() -> pd.DataFrame:
+    global _df_cache
+    if _df_cache is not None:
+        return _df_cache
+
+    url = f"https://docs.google.com/spreadsheets/d/{EXCEL_FILE_ID}/export?format=xlsx"
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+
+    df = pd.read_excel(io.BytesIO(resp.content), sheet_name=0, header=0)
+    df.columns = ["index", "大学名", "学校区分", "地域", "都道府県",
+                  "全体在学者数", "偏差値上限", "偏差値下限"] + list(df.columns[8:])
+
+    def safe_float(v):
+        try:
+            s = str(v).strip()
+            if s in ["-", "BF", "ボーダーフリー", "", "nan", "None"]:
+                return 35.0
+            return float(s)
+        except Exception:
+            return 0.0
+
+    df["全体在学者数"] = df["全体在学者数"].apply(safe_float)
+    df["偏差値上限"] = df["偏差値上限"].apply(safe_float)
+    df["偏差値下限"] = df["偏差値下限"].apply(safe_float)
+    df = df[df["大学名"].notna() & (df["大学名"].astype(str).str.strip() != "") & (df["大学名"].astype(str) != "nan")]
+
+    _df_cache = df
+    return df
+
+
+def is_stats_question(question: str) -> bool:
+    return any(kw in question for kw in STATS_KEYWORDS)
+
+
+def answer_from_excel(question: str, claude_client: anthropic.Anthropic) -> str:
+    try:
+        df = load_excel_df()
+    except Exception as e:
+        return f"大学データの読み込みに失敗しました: {e}"
+
+    # 絞り込み条件を抽出
+    try:
+        resp = claude_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=500,
+            messages=[{"role": "user", "content": STATS_FILTER_PROMPT.format(question=question)}],
+        )
+        raw = next((b.text for b in resp.content if hasattr(b, "text")), "{}")
+        conds = json.loads(raw.strip())
+    except Exception:
+        conds = {}
+
+    filtered = df.copy()
+
+    if conds.get("学校区分"):
+        filtered = filtered[filtered["学校区分"] == conds["学校区分"]]
+    if conds.get("都道府県"):
+        filtered = filtered[filtered["都道府県"].isin(conds["都道府県"])]
+    if conds.get("地域名"):
+        region = conds["地域名"]
+        prefs = next((v for k, v in REGION_MAP.items() if k in region or region in k), None)
+        if prefs:
+            filtered = filtered[filtered["都道府県"].isin(prefs)]
+    if conds.get("全体在学者数_以上") is not None:
+        filtered = filtered[filtered["全体在学者数"] >= conds["全体在学者数_以上"]]
+    if conds.get("全体在学者数_以下") is not None:
+        filtered = filtered[filtered["全体在学者数"] <= conds["全体在学者数_以下"]]
+    if conds.get("偏差値上限_以上") is not None:
+        filtered = filtered[filtered["偏差値上限"] >= conds["偏差値上限_以上"]]
+    if conds.get("偏差値上限_以下") is not None:
+        filtered = filtered[filtered["偏差値上限"] <= conds["偏差値上限_以下"]]
+    if conds.get("偏差値下限_以上") is not None:
+        filtered = filtered[filtered["偏差値下限"] >= conds["偏差値下限_以上"]]
+
+    summary = f"条件に該当する大学数: {len(filtered)}校\n\n"
+    if len(filtered) <= 50:
+        rows = []
+        for _, row in filtered.iterrows():
+            rows.append(
+                f"・{row['大学名']}（{row['学校区分']}／{row['都道府県']}）"
+                f" 在学者数:{int(row['全体在学者数'])}人 偏差値:{row['偏差値下限']}〜{row['偏差値上限']}"
+            )
+        summary += "\n".join(rows)
+    else:
+        summary += "（大学数が多いため一覧は省略します）"
+
+    prompt = f"""以下の大学データをもとに、質問に日本語で回答してください。
+
+【データ】
+{summary}
+
+【質問】
+{question}
+"""
+    resp2 = claude_client.messages.create(
+        model="claude-sonnet-5",
+        max_tokens=2000,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    text_block = next((b for b in resp2.content if hasattr(b, "text")), None)
+    return text_block.text if text_block else "回答を生成できませんでした。"
 
 
 def extract_filters(question: str, client: anthropic.Anthropic) -> dict:
@@ -92,12 +231,6 @@ def build_pinecone_filter(filters: dict) -> dict | None:
     return {"$and": conditions}
 
 
-def search(question: str, voyage_client, pinecone_index, top_k: int = 20) -> list[dict]:
-    embedding = voyage_client.embed([question], model="voyage-3", input_type="query").embeddings[0]
-    results = pinecone_index.query(vector=embedding, top_k=top_k, include_metadata=True)
-    return results["matches"]
-
-
 def answer(question: str, chunks: list[dict], claude_client: anthropic.Anthropic) -> str:
     context_parts = []
     for match in chunks:
@@ -137,6 +270,12 @@ def query_rag(
     top_k: int = 20,
 ) -> tuple[str, list[dict], dict]:
     claude_client = anthropic.Anthropic(api_key=anthropic_api_key)
+
+    # 集計・一覧系の質問はExcelデータから直接回答
+    if is_stats_question(question):
+        response_text = answer_from_excel(question, claude_client)
+        return response_text, [], {"モード": "統計検索（Excelデータ）"}
+
     voyage_client = voyageai.Client(api_key=voyage_api_key)
     pc = Pinecone(api_key=pinecone_api_key)
     index = pc.Index(pinecone_index_name)
