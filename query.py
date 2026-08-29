@@ -27,11 +27,15 @@ EXCEL_FILE_ID = "1ZBhQpO4cvu58uaD96rDVVFiypsM3r1SS"
 
 _df_cache = None
 
-STATS_KEYWORDS = [
-    "何校", "何大学", "いくつ", "何件", "件数", "数は", "数を",
-    "リストアップ", "一覧", "すべて", "全て", "列挙",
-    "平均", "最大", "最小", "合計", "ランキング", "上位", "下位",
-]
+STATS_DETECT_PROMPT = """以下の質問は「大学データの集計・カウント・一覧・ランキング」を求めていますか？
+YESまたはNOのみ答えてください。
+
+集計系の例：「何校ある？」「何個ある？」「いくつ？」「一覧を出して」「平均は？」「ランキングは？」「上位〇校」「リストアップ」
+内容検索系の例：「〇〇大学の評価は？」「地域連携の取り組みを教えて」「改善指摘事項は？」
+
+質問: {question}
+
+答え（YES/NO）:"""
 
 FILTER_EXTRACTION_PROMPT = """
 ユーザーの質問から、以下の検索条件を抽出してください。
@@ -109,8 +113,17 @@ def load_excel_df() -> pd.DataFrame:
     return df
 
 
-def is_stats_question(question: str) -> bool:
-    return any(kw in question for kw in STATS_KEYWORDS)
+def is_stats_question(question: str, claude_client: anthropic.Anthropic) -> bool:
+    try:
+        resp = claude_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=10,
+            messages=[{"role": "user", "content": STATS_DETECT_PROMPT.format(question=question)}],
+        )
+        text = next((b.text for b in resp.content if hasattr(b, "text")), "NO")
+        return "YES" in text.upper()
+    except Exception:
+        return False
 
 
 def answer_from_excel(question: str, claude_client: anthropic.Anthropic) -> str:
@@ -272,7 +285,7 @@ def query_rag(
     claude_client = anthropic.Anthropic(api_key=anthropic_api_key)
 
     # 集計・一覧系の質問はExcelデータから直接回答
-    if is_stats_question(question):
+    if is_stats_question(question, claude_client):
         response_text = answer_from_excel(question, claude_client)
         return response_text, [], {"モード": "統計検索（Excelデータ）"}
 
