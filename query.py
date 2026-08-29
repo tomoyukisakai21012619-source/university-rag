@@ -30,8 +30,20 @@ _df_cache = None
 STATS_DETECT_PROMPT = """以下の質問は「大学データの集計・カウント・一覧・ランキング」を求めていますか？
 YESまたはNOのみ答えてください。
 
-集計系の例：「何校ある？」「何個ある？」「いくつ？」「一覧を出して」「平均は？」「ランキングは？」「上位〇校」「リストアップ」
-内容検索系の例：「〇〇大学の評価は？」「地域連携の取り組みを教えて」「改善指摘事項は？」
+YESの例（Excelデータから集計・絞り込みが必要）：
+- 「学生数が10000人以上の大学は何校？」
+- 「偏差値60以上の私立大学の一覧を出して」
+- 「関東の国立大学をリストアップして」
+- 「在学者数の多い順にランキングして」
+
+NOの例（PDFの内容を読んで答えるべき質問）：
+- 「この16校に共通する認証評価の特徴は？」
+- 「〇〇大学の改善指摘事項は？」
+- 「地域連携が評価された事例を教えて」
+- 「前の回答の大学について詳しく教えて」
+- 「これらの大学の共通点は？」
+
+※「この〇校」「これらの大学」「前の結果」などの指示語が含まれる場合は必ずNO。
 
 質問: {question}
 
@@ -291,7 +303,8 @@ def build_pinecone_filter(filters: dict) -> dict | None:
     return {"$and": conditions}
 
 
-def answer(question: str, chunks: list[dict], claude_client: anthropic.Anthropic) -> str:
+def answer(question: str, chunks: list[dict], claude_client: anthropic.Anthropic,
+           history: list[dict] | None = None) -> str:
     context_parts = []
     for match in chunks:
         meta = match["metadata"]
@@ -302,20 +315,29 @@ def answer(question: str, chunks: list[dict], claude_client: anthropic.Anthropic
 
     context = "\n\n".join(context_parts)
 
-    prompt = f"""以下の大学認証評価・自己点検評価報告書の内容をもとに、質問に答えてください。
+    system_prompt = """あなたは大学認証評価・自己点検評価報告書の専門アシスタントです。
+提供された参考資料と会話履歴をもとに質問に答えてください。
 回答は日本語で、出典（大学名・報告書種別・ページ番号）を明記してください。
-情報が不足している場合はその旨を伝えてください。
+「この大学」「これらの大学」「前の回答」などの指示語は会話履歴を参照して解釈してください。"""
 
-【参考資料】
+    user_content = f"""【参考資料】
 {context}
 
 【質問】
-{question}
-"""
+{question}"""
+
+    # 会話履歴を含めてメッセージを構築
+    messages = []
+    if history:
+        for msg in history[-6:]:  # 直近3往復分
+            messages.append({"role": msg["role"], "content": msg["content"]})
+    messages.append({"role": "user", "content": user_content})
+
     response = claude_client.messages.create(
         model="claude-sonnet-5",
         max_tokens=2000,
-        messages=[{"role": "user", "content": prompt}],
+        system=system_prompt,
+        messages=messages,
     )
     text_block = next((b for b in response.content if hasattr(b, "text")), None)
     return text_block.text if text_block else "回答を生成できませんでした。"
@@ -328,6 +350,7 @@ def query_rag(
     pinecone_api_key: str,
     pinecone_index_name: str = "university-rag",
     top_k: int = 20,
+    history: list[dict] | None = None,
 ) -> tuple[str, list[dict], dict]:
     claude_client = anthropic.Anthropic(api_key=anthropic_api_key)
 
@@ -356,5 +379,5 @@ def query_rag(
         results = index.query(vector=embedding, top_k=top_k, include_metadata=True)
         matches = results["matches"]
 
-    response_text = answer(question, matches, claude_client)
+    response_text = answer(question, matches, claude_client, history=history)
     return response_text, matches, filters

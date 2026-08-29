@@ -84,6 +84,7 @@ def main():
                         pinecone_api_key=PINECONE_API_KEY,
                         pinecone_index_name=PINECONE_INDEX,
                         top_k=top_k,
+                        history=st.session_state.messages,
                     )
 
                     st.markdown(response_text)
