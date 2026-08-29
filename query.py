@@ -143,62 +143,32 @@ def answer_from_excel(question: str, claude_client: anthropic.Anthropic) -> str:
     except Exception as e:
         return f"大学データの読み込みに失敗しました: {e}"
 
-    # 絞り込み条件を抽出
-    try:
-        resp = claude_client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=500,
-            messages=[{"role": "user", "content": STATS_FILTER_PROMPT.format(question=question)}],
-        )
-        raw = next((b.text for b in resp.content if hasattr(b, "text")), "{}")
-        conds = json.loads(raw.strip())
-    except Exception:
-        conds = {}
-
-    filtered = df.copy()
-
-    if conds.get("学校区分"):
-        filtered = filtered[filtered["学校区分"] == conds["学校区分"]]
-    if conds.get("都道府県"):
-        filtered = filtered[filtered["都道府県"].isin(conds["都道府県"])]
-    if conds.get("地域名"):
-        region = conds["地域名"]
-        prefs = next((v for k, v in REGION_MAP.items() if k in region or region in k), None)
-        if prefs:
-            filtered = filtered[filtered["都道府県"].isin(prefs)]
-    if conds.get("全体在学者数_以上") is not None:
-        filtered = filtered[filtered["全体在学者数"] >= float(conds["全体在学者数_以上"])]
-    if conds.get("全体在学者数_以下") is not None:
-        filtered = filtered[filtered["全体在学者数"] <= float(conds["全体在学者数_以下"])]
-    if conds.get("偏差値上限_以上") is not None:
-        filtered = filtered[filtered["偏差値上限"] >= float(conds["偏差値上限_以上"])]
-    if conds.get("偏差値上限_以下") is not None:
-        filtered = filtered[filtered["偏差値上限"] <= float(conds["偏差値上限_以下"])]
-    if conds.get("偏差値下限_以上") is not None:
-        filtered = filtered[filtered["偏差値下限"] >= float(conds["偏差値下限_以上"])]
-    if conds.get("偏差値下限_以下") is not None:
-        filtered = filtered[filtered["偏差値下限"] <= float(conds["偏差値下限_以下"])]
-
-    # 結果を直接構築して返す（Claudeへの依存を最小化）
-    count = len(filtered)
+    # 全大学データをテキスト化してClaudeに渡す
     rows = []
-    for _, row in filtered.iterrows():
+    for _, row in df.iterrows():
         rows.append(
-            f"・{row['大学名']}（{row['学校区分']}／{row['都道府県']}）"
-            f" 在学者数:{int(row['全体在学者数'])}人 偏差値:{row['偏差値下限']}〜{row['偏差値上限']}"
+            f"{row['大学名']},{row['学校区分']},{row['都道府県']},{row['地域']},"
+            f"在学者数{int(row['全体在学者数'])}人,偏差値下限{row['偏差値下限']},偏差値上限{row['偏差値上限']}"
         )
+    data_text = "\n".join(rows)
 
-    # 抽出した条件を表示（デバッグ用）
-    conds_str = "、".join([f"{k}={v}" for k, v in conds.items() if v is not None]) or "なし"
+    prompt = f"""以下は日本の大学一覧データです（大学名,学校区分,都道府県,地域,在学者数,偏差値下限,偏差値上限）。
+このデータを使って質問に正確に答えてください。
+集計・カウント・一覧抽出が必要な場合はデータから直接計算してください。
 
-    if count == 0:
-        detail = "該当する大学はありませんでした。"
-    elif count <= 100:
-        detail = "\n".join(rows)
-    else:
-        detail = f"（{count}校あるため先頭30校のみ表示）\n" + "\n".join(rows[:30])
+【大学データ】
+{data_text}
 
-    return f"【抽出条件】{conds_str}\n\n【結果】{count}校が該当します。\n\n{detail}"
+【質問】
+{question}
+"""
+    resp = claude_client.messages.create(
+        model="claude-sonnet-5",
+        max_tokens=3000,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    text_block = next((b for b in resp.content if hasattr(b, "text")), None)
+    return text_block.text if text_block else "回答を生成できませんでした。"
 
 
 def extract_filters(question: str, client: anthropic.Anthropic) -> dict:
