@@ -137,38 +137,109 @@ def is_stats_question(question: str, claude_client: anthropic.Anthropic) -> bool
         return False
 
 
+def extract_number(text: str, keywords: list[str]) -> float | None:
+    """質問文からキーワードに関連する数値を抽出する"""
+    import re
+    for kw in keywords:
+        pattern = rf"{kw}[^0-9]*([0-9][0-9,，]*(?:\.[0-9]+)?)"
+        m = re.search(pattern, text)
+        if m:
+            return float(m.group(1).replace(",", "").replace("，", ""))
+    # キーワードの後ろだけでなく前も探す
+    for kw in keywords:
+        pattern = rf"([0-9][0-9,，]*(?:\.[0-9]+)?)[^0-9]*{kw}"
+        m = re.search(pattern, text)
+        if m:
+            return float(m.group(1).replace(",", "").replace("，", ""))
+    return None
+
+
 def answer_from_excel(question: str, claude_client: anthropic.Anthropic) -> str:
     try:
         df = load_excel_df()
     except Exception as e:
         return f"大学データの読み込みに失敗しました: {e}"
 
-    # 全大学データをテキスト化してClaudeに渡す
+    filtered = df.copy()
+    applied = []
+
+    # 学校区分
+    for k in ["私立", "国立", "公立"]:
+        if k in question:
+            filtered = filtered[filtered["学校区分"] == k]
+            applied.append(f"学校区分={k}")
+            break
+
+    # 地域・都道府県
+    for region, prefs in REGION_MAP.items():
+        if region in question:
+            filtered = filtered[filtered["都道府県"].isin(prefs)]
+            applied.append(f"地域={region}")
+            break
+    else:
+        for pref in ["東京", "大阪", "京都", "神奈川", "愛知", "福岡", "北海道", "宮城",
+                     "広島", "兵庫", "埼玉", "千葉", "静岡", "茨城", "栃木", "群馬"]:
+            if pref in question:
+                filtered = filtered[filtered["都道府県"] == pref]
+                applied.append(f"都道府県={pref}")
+                break
+
+    # 在学者数
+    num = extract_number(question, ["学生数", "在学者数", "人以上", "人超"])
+    if num and ("以上" in question or "超" in question or "以上" in question):
+        filtered = filtered[filtered["全体在学者数"] >= num]
+        applied.append(f"在学者数≥{int(num)}")
+    num = extract_number(question, ["学生数", "在学者数", "人以下", "人未満"])
+    if num and ("以下" in question or "未満" in question):
+        filtered = filtered[filtered["全体在学者数"] <= num]
+        applied.append(f"在学者数≤{int(num)}")
+
+    # 偏差値（上限・下限を文脈で判断）
+    import re
+    deviation_nums = re.findall(r"偏差値[^\d]*(\d+(?:\.\d+)?)", question)
+    if deviation_nums:
+        val = float(deviation_nums[0])
+        if "最低" in question or "下限" in question or "最小" in question:
+            if "以上" in question or "超" in question:
+                filtered = filtered[filtered["偏差値下限"] >= val]
+                applied.append(f"偏差値下限≥{val}")
+            else:
+                filtered = filtered[filtered["偏差値下限"] <= val]
+                applied.append(f"偏差値下限≤{val}")
+        elif "最高" in question or "上限" in question or "最大" in question:
+            if "以上" in question or "超" in question:
+                filtered = filtered[filtered["偏差値上限"] >= val]
+                applied.append(f"偏差値上限≥{val}")
+            else:
+                filtered = filtered[filtered["偏差値上限"] <= val]
+                applied.append(f"偏差値上限≤{val}")
+        else:
+            # デフォルト：偏差値上限で判定
+            if "以上" in question or "超" in question:
+                filtered = filtered[filtered["偏差値上限"] >= val]
+                applied.append(f"偏差値上限≥{val}")
+            else:
+                filtered = filtered[filtered["偏差値上限"] <= val]
+                applied.append(f"偏差値上限≤{val}")
+
+    count = len(filtered)
+    conds_str = "、".join(applied) if applied else "なし"
+
     rows = []
-    for _, row in df.iterrows():
+    for _, row in filtered.sort_values("全体在学者数", ascending=False).iterrows():
         rows.append(
-            f"{row['大学名']},{row['学校区分']},{row['都道府県']},{row['地域']},"
-            f"在学者数{int(row['全体在学者数'])}人,偏差値下限{row['偏差値下限']},偏差値上限{row['偏差値上限']}"
+            f"・{row['大学名']}（{row['学校区分']}／{row['都道府県']}）"
+            f" 在学者数:{int(row['全体在学者数'])}人 偏差値:{row['偏差値下限']}〜{row['偏差値上限']}"
         )
-    data_text = "\n".join(rows)
 
-    prompt = f"""以下は日本の大学一覧データです（大学名,学校区分,都道府県,地域,在学者数,偏差値下限,偏差値上限）。
-このデータを使って質問に正確に答えてください。
-集計・カウント・一覧抽出が必要な場合はデータから直接計算してください。
+    if count == 0:
+        detail = "該当する大学はありませんでした。"
+    elif count <= 100:
+        detail = "\n".join(rows)
+    else:
+        detail = f"（{count}校あるため在学者数上位30校を表示）\n" + "\n".join(rows[:30])
 
-【大学データ】
-{data_text}
-
-【質問】
-{question}
-"""
-    resp = claude_client.messages.create(
-        model="claude-sonnet-5",
-        max_tokens=3000,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    text_block = next((b for b in resp.content if hasattr(b, "text")), None)
-    return text_block.text if text_block else "回答を生成できませんでした。"
+    return f"【適用条件】{conds_str}\n\n【結果】{count}校が該当します。\n\n{detail}"
 
 
 def extract_filters(question: str, client: anthropic.Anthropic) -> dict:
