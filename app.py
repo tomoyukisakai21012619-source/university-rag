@@ -1,5 +1,6 @@
 import os
 import json
+from datetime import datetime, timezone, timedelta
 import streamlit as st
 from query import query_rag
 
@@ -9,10 +10,38 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 VOYAGE_API_KEY    = os.environ.get("VOYAGE_API_KEY", "")
 PINECONE_API_KEY  = os.environ.get("PINECONE_API_KEY", "")
 PINECONE_INDEX    = os.environ.get("PINECONE_INDEX", "university-rag")
+AUTH_USERS        = json.loads(os.environ.get("AUTH_USERS", "{}"))
 
-# ユーザー情報: 環境変数 AUTH_USERS に JSON 形式で格納
-# 例: {"sakai": "password123", "yamada": "pass456"}
-AUTH_USERS = json.loads(os.environ.get("AUTH_USERS", "{}"))
+# Googleスプレッドシートのログ設定
+SPREADSHEET_ID    = "1uZHj8A4i4rd5pRb8aeX6CMhyjQ1_9yklSKBvPb5E1G4"
+GCP_CREDENTIALS   = os.environ.get("GCP_CREDENTIALS", "")  # JSON文字列
+
+JST = timezone(timedelta(hours=9))
+
+
+def get_jst_now() -> str:
+    return datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def write_log(username: str, kind: str, content: str):
+    """Googleスプレッドシートにログを1行追記する"""
+    if not GCP_CREDENTIALS:
+        return
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+        creds_dict = json.loads(GCP_CREDENTIALS)
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_key(SPREADSHEET_ID)
+        ws = sh.sheet1
+        ws.append_row([get_jst_now(), username, kind, content])
+    except Exception:
+        pass  # ログ失敗はサイレントに無視
 
 
 def check_login():
@@ -31,6 +60,7 @@ def check_login():
                 if username in AUTH_USERS and AUTH_USERS[username] == password:
                     st.session_state.logged_in = True
                     st.session_state.username = username
+                    write_log(username, "ログイン", "")
                     st.rerun()
                 else:
                     st.error("ユーザー名またはパスワードが違います")
@@ -47,6 +77,7 @@ def main():
     with st.sidebar:
         st.markdown(f"👤 {st.session_state.get('username', '')}")
         if st.button("ログアウト"):
+            write_log(st.session_state.get("username", ""), "ログアウト", "")
             st.session_state.logged_in = False
             st.rerun()
         st.markdown("---")
@@ -88,6 +119,9 @@ def main():
                     )
 
                     st.markdown(response_text)
+
+                    # 質問ログを記録
+                    write_log(st.session_state.get("username", ""), "質問", question)
 
                     if filters:
                         active = {k: v for k, v in filters.items() if v and k != "地域名"}
